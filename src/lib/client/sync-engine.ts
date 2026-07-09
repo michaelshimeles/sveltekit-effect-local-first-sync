@@ -1,11 +1,38 @@
 import { browser } from '$app/environment';
+import { liveQuery } from 'dexie';
 import { getClientId } from './identity';
 import { db } from './local-db';
 import { markOutboxFailed, realtimeActivity, syncActivity } from './local-store';
 import type { LocalItem, OutboxMutation, ServerItem, SyncChange, SyncResponse } from '$lib/shared/types';
 
 let syncInFlight = false;
-type SyncReason = 'manual' | 'interval' | 'online' | 'startup' | 'realtime';
+let queuedSyncReason: SyncReason | null = null;
+let scheduledSyncReason: SyncReason | null = null;
+let scheduledSyncTimer: number | null = null;
+
+type SyncReason = 'manual' | 'interval' | 'online' | 'startup' | 'realtime' | 'local';
+
+const reasonPriority: Record<SyncReason, number> = {
+	interval: 0,
+	startup: 1,
+	online: 2,
+	realtime: 3,
+	local: 4,
+	manual: 5
+};
+
+function preferredReason(current: SyncReason | null, next: SyncReason) {
+	if (!current) return next;
+	return reasonPriority[next] >= reasonPriority[current] ? next : current;
+}
+
+function syncMessage(reason: SyncReason) {
+	if (reason === 'manual') return 'Syncing now';
+	if (reason === 'local') return 'Syncing local changes';
+	if (reason === 'realtime') return 'Realtime change received';
+	if (reason === 'online') return 'Back online, syncing';
+	return 'Background sync';
+}
 
 function toLocalItem(item: ServerItem): LocalItem {
 	return {
@@ -56,8 +83,36 @@ async function mergeServerItems(items: ServerItem[], sent: OutboxMutation[], res
 	});
 }
 
+export function requestSync(reason: SyncReason = 'local', delay = 25) {
+	if (!browser) return;
+
+	scheduledSyncReason = preferredReason(scheduledSyncReason, reason);
+
+	if (scheduledSyncTimer !== null) {
+		window.clearTimeout(scheduledSyncTimer);
+	}
+
+	scheduledSyncTimer = window.setTimeout(() => {
+		const nextReason = scheduledSyncReason ?? reason;
+		scheduledSyncTimer = null;
+		scheduledSyncReason = null;
+		void syncNow(nextReason);
+	}, delay);
+}
+
 export async function syncNow(reason: SyncReason = 'manual') {
-	if (!browser || syncInFlight) return;
+	if (!browser) return;
+
+	if (scheduledSyncTimer !== null) {
+		window.clearTimeout(scheduledSyncTimer);
+		scheduledSyncTimer = null;
+		scheduledSyncReason = null;
+	}
+
+	if (syncInFlight) {
+		queuedSyncReason = preferredReason(queuedSyncReason, reason);
+		return;
+	}
 
 	if (!navigator.onLine) {
 		syncActivity.set({
@@ -74,12 +129,7 @@ export async function syncNow(reason: SyncReason = 'manual') {
 	syncActivity.update((state) => ({
 		...state,
 		status: 'syncing',
-		lastMessage:
-			reason === 'manual'
-				? 'Syncing now'
-				: reason === 'realtime'
-					? 'Realtime change received'
-					: 'Background sync',
+		lastMessage: syncMessage(reason),
 		error: null
 	}));
 
@@ -133,6 +183,12 @@ export async function syncNow(reason: SyncReason = 'manual') {
 		}));
 	} finally {
 		syncInFlight = false;
+
+		if (queuedSyncReason) {
+			const nextReason = queuedSyncReason;
+			queuedSyncReason = null;
+			requestSync(nextReason, 0);
+		}
 	}
 }
 
@@ -188,6 +244,7 @@ function startRealtimeConnection() {
 				lastMessageAt: null,
 				message: 'Realtime connected'
 			});
+			requestSync('online', 0);
 		});
 
 		socket.addEventListener('message', (event) => {
@@ -220,7 +277,7 @@ function startRealtimeConnection() {
 				}));
 
 				if (message.sourceClientId !== getClientId()) {
-					void syncNow('realtime');
+					requestSync('realtime', 0);
 				}
 			} catch (error) {
 				console.error('Invalid realtime message', error);
@@ -253,12 +310,40 @@ function startRealtimeConnection() {
 	};
 }
 
+function startLocalOutboxSync() {
+	let lastSignature: string | null = null;
+
+	const subscription = liveQuery(async () => {
+		const rows = await db.outbox.orderBy('createdAt').toArray();
+		return rows.map((mutation) => `${mutation.id}:${mutation.createdAt}`).join('|');
+	}).subscribe({
+		next(signature) {
+			if (lastSignature === null) {
+				lastSignature = signature;
+				if (signature) requestSync('startup', 0);
+				return;
+			}
+
+			if (signature === lastSignature) return;
+
+			lastSignature = signature;
+			if (signature) requestSync('local', 25);
+		},
+		error(error) {
+			console.error('Outbox sync watcher failed', error);
+		}
+	});
+
+	return () => subscription.unsubscribe();
+}
+
 export function startSyncLoop() {
 	if (!browser) return () => {};
 
-	const sync = (reason: 'interval' | 'online') => void syncNow(reason);
+	const sync = (reason: 'interval' | 'online') => requestSync(reason, 0);
 	const interval = window.setInterval(() => sync('interval'), 4000);
 	const stopRealtime = startRealtimeConnection();
+	const stopOutboxSync = startLocalOutboxSync();
 	const onlineHandler = () => sync('online');
 	const visibilityHandler = () => {
 		if (document.visibilityState === 'visible') sync('interval');
@@ -271,6 +356,7 @@ export function startSyncLoop() {
 	return () => {
 		window.clearInterval(interval);
 		stopRealtime();
+		stopOutboxSync();
 		window.removeEventListener('online', onlineHandler);
 		document.removeEventListener('visibilitychange', visibilityHandler);
 	};
