@@ -1,17 +1,53 @@
 # Self Sync
 
-Self Sync is a local-first sync engine for SvelteKit and Effect. It keeps the UI reactive from IndexedDB, writes offline-first through an outbox, syncs to SQL storage, and uses WebSockets to wake up other clients as changes land.
+Self Sync is a local-first sync framework for SvelteKit and Effect.
+
+It gives you instant local UI, durable SQL-backed sync, and realtime convergence without making realtime the source of truth. Apps read and write to IndexedDB first, queue mutations while offline, sync to Postgres or MySQL when a connection is available, and use WebSockets to wake up other clients as changes land.
+
+In one line:
+
+> Local-first UX, SQL durability, realtime convergence.
 
 Live app: https://sveltekit-effect-local-first-sync.vercel.app
 
-## What This Proves
+## How To Explain It
 
-- A SvelteKit app can feel instant because reads and writes hit local IndexedDB first.
-- Chat and kanban views can share the same local-first records and stay reactive through Dexie `liveQuery`.
-- Creates, edits, and deletes work offline, queue locally, and converge after reconnect.
-- Server sync can stay deterministic with Effect Schema validation, idempotent mutation IDs, revisions, timestamps, and delete tombstones.
-- Realtime can stay simple: WebSockets only send invalidations, then every client pulls through the same sync endpoint.
-- Postgres and MySQL can use the same sync contract, with memory storage available for zero-config local development.
+Self Sync is both local-first and realtime, but local-first is the core.
+
+Realtime is the acceleration layer. It does not carry authoritative app state or replace sync. It only tells connected clients that something changed, then each client pulls through the same sync endpoint and merges the result into its local database.
+
+That means the app stays useful offline, feels instant while online, and still converges across tabs, browsers, and devices.
+
+## What This Gives You
+
+- **Instant UI:** reads and writes hit IndexedDB first, and Svelte updates from Dexie `liveQuery`.
+- **Offline writes:** creates, edits, drag/drop moves, and deletes queue locally when the network is unavailable.
+- **Durable sync:** the server persists records in Postgres or MySQL through a shared sync contract.
+- **Realtime convergence:** WebSockets send invalidations so other clients pull fresh state immediately.
+- **Deterministic conflict handling:** Effect validates requests, mutation IDs make retries idempotent, revisions and timestamps resolve stale writes, and tombstones make deletes sync correctly.
+- **Zero-config development:** memory storage works locally without a database.
+
+## Mental Model
+
+```text
+User action
+  -> IndexedDB write
+  -> reactive Svelte UI update
+  -> outbox mutation
+  -> POST /api/sync
+  -> Postgres/MySQL
+  -> WebSocket invalidation
+  -> other clients pull and merge
+```
+
+The local database is the render source. SQL is the durable shared source. WebSockets are only the notification path.
+
+## Demo App
+
+The demo shows the framework with two views over the same synced records:
+
+- **Chat:** type a message and press Enter. The message appears immediately and syncs in the background.
+- **Kanban:** cards can be edited, deleted, and dragged between Trello-style columns. Moves are local-first mutations and sync like any other write.
 
 ## Stack
 
