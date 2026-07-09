@@ -2,6 +2,7 @@ create table if not exists sync_items (
 	id text primary key,
 	name text not null,
 	note text not null default '',
+	stage text not null default 'todo',
 	revision integer not null default 0,
 	updated_at bigint not null,
 	deleted_at bigint,

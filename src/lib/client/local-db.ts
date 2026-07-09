@@ -14,6 +14,21 @@ class LocalFirstDatabase extends Dexie {
 			outbox: 'id, itemId, op, createdAt, attempts',
 			meta: 'key'
 		});
+
+		this.version(2)
+			.stores({
+				items: 'id, syncStatus, updatedAt, deletedAt, revision, stage',
+				outbox: 'id, itemId, op, createdAt, attempts',
+				meta: 'key'
+			})
+			.upgrade((tx) =>
+				tx
+					.table<LocalItem, string>('items')
+					.toCollection()
+					.modify((item) => {
+						item.stage ??= 'todo';
+					})
+			);
 	}
 }
 

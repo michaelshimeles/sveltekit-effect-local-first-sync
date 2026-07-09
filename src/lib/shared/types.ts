@@ -1,11 +1,13 @@
 export type SyncStatus = 'synced' | 'pending' | 'error';
 export type MutationOperation = 'upsert' | 'delete';
 export type DatabaseMode = 'memory' | 'postgres' | 'mysql';
+export type KanbanStage = 'todo' | 'doing' | 'done';
 
 export interface ServerItem {
 	id: string;
 	name: string;
 	note: string;
+	stage: KanbanStage;
 	revision: number;
 	updatedAt: number;
 	deletedAt: number | null;
@@ -21,6 +23,7 @@ export interface ClientSyncItem {
 	id: string;
 	name: string;
 	note: string;
+	stage: KanbanStage;
 	updatedAt: number;
 	deletedAt: number | null;
 }

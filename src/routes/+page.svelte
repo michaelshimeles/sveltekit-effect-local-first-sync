@@ -1,12 +1,17 @@
 <script lang="ts">
 	import {
 		AlertCircle,
+		ArrowLeft,
+		ArrowRight,
 		CheckCircle2,
 		Cloud,
+		Columns3,
 		Database,
 		HardDrive,
+		MessageSquare,
 		Plus,
 		RefreshCw,
+		Send,
 		Server,
 		Trash2,
 		Wifi,
@@ -20,6 +25,7 @@
 	import { Input } from '$lib/components/ui/input';
 	import { Label } from '$lib/components/ui/label';
 	import { Separator } from '$lib/components/ui/separator';
+	import * as Tabs from '$lib/components/ui/tabs';
 	import { Textarea } from '$lib/components/ui/textarea';
 	import {
 		addLocalItem,
@@ -31,12 +37,21 @@
 		updateLocalItem
 	} from '$lib/client/local-store';
 	import { startSyncLoop, syncNow } from '$lib/client/sync-engine';
-	import type { LocalItem } from '$lib/shared/types';
+	import type { KanbanStage, LocalItem } from '$lib/shared/types';
 	import { cn } from '$lib/utils';
 
+	const kanbanStages: ReadonlyArray<{ id: KanbanStage; label: string; description: string }> = [
+		{ id: 'todo', label: 'To do', description: 'Queued ideas and new work' },
+		{ id: 'doing', label: 'Doing', description: 'Active work in progress' },
+		{ id: 'done', label: 'Done', description: 'Completed and synced' }
+	];
+
+	let activeTab = $state('chat');
 	let name = $state('');
 	let note = $state('');
 	let formError = $state('');
+	let chatMessage = $state('');
+	let chatError = $state('');
 	let pendingDelete = $state<LocalItem | null>(null);
 	let deleteDialogOpen = $state(false);
 	let cleanup = $state<() => void>(() => {});
@@ -55,9 +70,27 @@
 			return;
 		}
 
-		await addLocalItem({ name, note });
+		await addLocalItem({ name, note, stage: 'todo' });
 		name = '';
 		note = '';
+	}
+
+	async function handleSendMessage(event: SubmitEvent) {
+		event.preventDefault();
+		chatError = '';
+
+		const message = chatMessage.trim();
+		if (!message) {
+			chatError = 'Message is required.';
+			return;
+		}
+
+		await addLocalItem({
+			name: messageTitle(message),
+			note: message,
+			stage: 'todo'
+		});
+		chatMessage = '';
 	}
 
 	async function handleDeleteConfirmed() {
@@ -87,6 +120,11 @@
 		return '';
 	}
 
+	function messageTitle(message: string) {
+		const firstLine = message.split('\n').find((line) => line.trim())?.trim() ?? 'Message';
+		return firstLine.length > 56 ? `${firstLine.slice(0, 53)}...` : firstLine;
+	}
+
 	function formatTime(value: number | null) {
 		if (!value) return 'Never';
 		return new Intl.DateTimeFormat(undefined, {
@@ -100,6 +138,26 @@
 		if (item.syncStatus === 'synced') return 'Synced';
 		if (item.syncStatus === 'error') return 'Retrying';
 		return 'Queued';
+	}
+
+	function stageItems(items: LocalItem[], stage: KanbanStage) {
+		return items.filter((item) => (item.stage ?? 'todo') === stage);
+	}
+
+	function chatItems(items: LocalItem[]) {
+		return [...items].reverse();
+	}
+
+	function stageIndex(stage: KanbanStage) {
+		return kanbanStages.findIndex((item) => item.id === stage);
+	}
+
+	function nextStage(stage: KanbanStage) {
+		return kanbanStages[stageIndex(stage) + 1]?.id;
+	}
+
+	function previousStage(stage: KanbanStage) {
+		return kanbanStages[stageIndex(stage) - 1]?.id;
 	}
 </script>
 
@@ -184,125 +242,259 @@
 		</div>
 	</header>
 
-	<main class="mx-auto grid max-w-7xl gap-6 px-4 py-6 sm:px-6 lg:grid-cols-[minmax(0,1fr)_360px] lg:px-8">
-		<section class="space-y-4">
-			<Card.Root>
-				<Card.Content>
-					<form onsubmit={handleAdd}>
-						<div class="grid gap-3 md:grid-cols-[minmax(0,280px)_minmax(0,1fr)_auto]">
-							<div class="grid gap-1.5">
-								<Label for="item-name">Name</Label>
-								<Input
-									id="item-name"
-									bind:value={name}
-									class="h-9"
-									placeholder="Item name"
-									type="text"
-								/>
-							</div>
+	<main
+		class="mx-auto grid max-w-7xl gap-6 px-4 py-6 sm:px-6 lg:grid-cols-[minmax(0,1fr)_360px] lg:px-8"
+	>
+		<Tabs.Root bind:value={activeTab} class="min-w-0">
+			<div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+				<Tabs.List class="w-full sm:w-fit">
+					<Tabs.Trigger value="chat" class="gap-2">
+						<MessageSquare class="size-4" />
+						Chat
+					</Tabs.Trigger>
+					<Tabs.Trigger value="kanban" class="gap-2">
+						<Columns3 class="size-4" />
+						Kanban
+					</Tabs.Trigger>
+				</Tabs.List>
 
-							<div class="grid gap-1.5">
-								<Label for="item-note">Note</Label>
-								<Input
-									id="item-note"
-									bind:value={note}
-									class="h-9"
-									placeholder="Optional note"
-									type="text"
-								/>
-							</div>
+				<p class="text-xs text-muted-foreground">
+					{$localSummary.total} records, {$localSummary.queued} queued
+				</p>
+			</div>
 
-							<Button type="submit" size="lg" class="h-9 w-full md:mt-auto md:w-auto">
-								<Plus class="size-4" />
-								Add
-							</Button>
+			<Tabs.Content value="chat" class="space-y-4">
+				<Card.Root>
+					<Card.Header>
+						<Card.Title>Chat</Card.Title>
+						<Card.Description>
+							Messages are local-first records and appear on the kanban board as To do cards.
+						</Card.Description>
+					</Card.Header>
+					<Card.Content class="space-y-4">
+						<div class="max-h-[52rem] space-y-3 overflow-y-auto rounded-md bg-muted/30 p-3">
+							{#if $localItems.length === 0}
+								<div class="rounded-md border border-dashed bg-background px-4 py-8 text-center">
+									<p class="text-sm font-medium">No messages yet</p>
+									<p class="mt-1 text-xs text-muted-foreground">
+										Send the first message and it will sync locally.
+									</p>
+								</div>
+							{:else}
+								{#each chatItems($localItems) as item (item.id)}
+									<div class="flex gap-3">
+										<div
+											class="flex size-8 shrink-0 items-center justify-center rounded-md bg-primary text-xs font-semibold text-primary-foreground"
+										>
+											SS
+										</div>
+										<div class="min-w-0 flex-1 rounded-md border bg-background px-3 py-2">
+											<div class="flex flex-wrap items-center justify-between gap-2">
+												<p class="truncate text-sm font-medium">{item.name}</p>
+												<Badge
+													variant="outline"
+													class={cn(
+														'h-5 gap-1 rounded-md px-2',
+														item.syncStatus === 'synced' &&
+															'border-emerald-200 bg-emerald-50 text-emerald-800',
+														item.syncStatus === 'pending' &&
+															'border-amber-200 bg-amber-50 text-amber-800',
+														item.syncStatus === 'error' && 'border-red-200 bg-red-50 text-red-800'
+													)}
+												>
+													{statusLabel(item)}
+												</Badge>
+											</div>
+											<p class="mt-1 whitespace-pre-wrap text-sm leading-6 text-muted-foreground">
+												{item.note || item.name}
+											</p>
+										</div>
+									</div>
+								{/each}
+							{/if}
 						</div>
 
-						{#if formError}
-							<p class="mt-2 text-sm text-destructive">{formError}</p>
-						{/if}
-					</form>
-				</Card.Content>
-			</Card.Root>
+						<form class="space-y-3" onsubmit={handleSendMessage}>
+							<Label for="chat-message">Message</Label>
+							<Textarea
+								id="chat-message"
+								bind:value={chatMessage}
+								class="min-h-24 resize-y"
+								placeholder="Write a message..."
+							/>
+							<div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+								{#if chatError}
+									<p class="text-sm text-destructive">{chatError}</p>
+								{:else}
+									<p class="text-xs text-muted-foreground">New messages start in To do.</p>
+								{/if}
+								<Button type="submit" size="lg" class="h-9 w-full sm:w-auto">
+									<Send class="size-4" />
+									Send
+								</Button>
+							</div>
+						</form>
+					</Card.Content>
+				</Card.Root>
+			</Tabs.Content>
 
-			<div class="space-y-3">
-				{#if $localItems.length === 0}
-					<Card.Root class="border-dashed">
-						<Card.Content class="py-8 text-center">
-							<p class="text-base font-medium">No local records</p>
-							<p class="mt-1 text-pretty text-sm text-muted-foreground">
-								Create one and it will sync immediately.
-							</p>
-						</Card.Content>
-					</Card.Root>
-				{:else}
-					{#each $localItems as item (item.id)}
-						<Card.Root size="sm">
-							<Card.Content>
-								<div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
-									<div class="grid gap-3">
-										<Input
-											class="h-9 bg-muted/40 text-base font-medium"
-											value={item.name}
-											oninput={(event) =>
-												updateLocalItem(item.id, {
-													name: fieldValue(event)
-												})}
-										/>
-										<Textarea
-											class="min-h-20 resize-y bg-muted/40 text-sm leading-6"
-											value={item.note}
-											oninput={(event) =>
-												updateLocalItem(item.id, {
-													note: fieldValue(event)
-												})}
-										/>
-									</div>
-
-									<div class="flex items-start justify-between gap-3 md:flex-col md:items-end">
-										<Badge
-											variant="outline"
-											class={cn(
-												'h-7 gap-2 rounded-md px-2.5',
-												item.syncStatus === 'synced' &&
-													'border-emerald-200 bg-emerald-50 text-emerald-800',
-												item.syncStatus === 'pending' &&
-													'border-amber-200 bg-amber-50 text-amber-800',
-												item.syncStatus === 'error' && 'border-red-200 bg-red-50 text-red-800'
-											)}
-										>
-											{#if item.syncStatus === 'synced'}
-												<CheckCircle2 class="size-3.5" />
-											{:else}
-												<AlertCircle class="size-3.5" />
-											{/if}
-											{statusLabel(item)}
-										</Badge>
-
-										<Button
-											type="button"
-											variant="outline"
-											size="icon-lg"
-											aria-label={`Delete ${item.name}`}
-											title="Delete"
-											onclick={() => requestDelete(item)}
-										>
-											<Trash2 class="size-4" />
-										</Button>
-									</div>
+			<Tabs.Content value="kanban" class="space-y-4">
+				<Card.Root>
+					<Card.Content>
+						<form onsubmit={handleAdd}>
+							<div class="grid gap-3 md:grid-cols-[minmax(0,260px)_minmax(0,1fr)_auto]">
+								<div class="grid gap-1.5">
+									<Label for="item-name">Card</Label>
+									<Input
+										id="item-name"
+										bind:value={name}
+										class="h-9"
+										placeholder="Card title"
+										type="text"
+									/>
 								</div>
 
-								{#if item.lastError}
-									<p class="mt-3 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-										{item.lastError}
-									</p>
+								<div class="grid gap-1.5">
+									<Label for="item-note">Note</Label>
+									<Input
+										id="item-note"
+										bind:value={note}
+										class="h-9"
+										placeholder="Optional note"
+										type="text"
+									/>
+								</div>
+
+								<Button type="submit" size="lg" class="h-9 w-full md:mt-auto md:w-auto">
+									<Plus class="size-4" />
+									Add card
+								</Button>
+							</div>
+
+							{#if formError}
+								<p class="mt-2 text-sm text-destructive">{formError}</p>
+							{/if}
+						</form>
+					</Card.Content>
+				</Card.Root>
+
+				<div class="grid gap-4 xl:grid-cols-3">
+					{#each kanbanStages as stage}
+						<section class="min-w-0 rounded-lg border bg-muted/20 p-3">
+							<div class="mb-3 flex items-start justify-between gap-3">
+								<div>
+									<h2 class="text-sm font-medium">{stage.label}</h2>
+									<p class="mt-1 text-xs text-muted-foreground">{stage.description}</p>
+								</div>
+								<Badge variant="secondary" class="rounded-md">
+									{stageItems($localItems, stage.id).length}
+								</Badge>
+							</div>
+
+							<div class="space-y-3">
+								{#if stageItems($localItems, stage.id).length === 0}
+									<div class="rounded-md border border-dashed bg-background/60 px-3 py-6 text-center">
+										<p class="text-xs text-muted-foreground">No cards</p>
+									</div>
+								{:else}
+									{#each stageItems($localItems, stage.id) as item (item.id)}
+										<Card.Root size="sm">
+											<Card.Content class="space-y-3">
+												<Input
+													class="h-9 bg-muted/40 text-sm font-medium"
+													value={item.name}
+													oninput={(event) =>
+														updateLocalItem(item.id, {
+															name: fieldValue(event)
+														})}
+												/>
+												<Textarea
+													class="min-h-20 resize-y bg-muted/40 text-sm leading-6"
+													value={item.note}
+													oninput={(event) =>
+														updateLocalItem(item.id, {
+															note: fieldValue(event)
+														})}
+												/>
+
+												<div class="flex flex-wrap items-center justify-between gap-2">
+													<Badge
+														variant="outline"
+														class={cn(
+															'h-7 gap-2 rounded-md px-2.5',
+															item.syncStatus === 'synced' &&
+																'border-emerald-200 bg-emerald-50 text-emerald-800',
+															item.syncStatus === 'pending' &&
+																'border-amber-200 bg-amber-50 text-amber-800',
+															item.syncStatus === 'error' &&
+																'border-red-200 bg-red-50 text-red-800'
+														)}
+													>
+														{#if item.syncStatus === 'synced'}
+															<CheckCircle2 class="size-3.5" />
+														{:else}
+															<AlertCircle class="size-3.5" />
+														{/if}
+														{statusLabel(item)}
+													</Badge>
+
+													<div class="flex items-center gap-1">
+														<Button
+															type="button"
+															variant="outline"
+															size="icon"
+															aria-label={`Move ${item.name} left`}
+															disabled={!previousStage(item.stage ?? 'todo')}
+															onclick={() => {
+																const previous = previousStage(item.stage ?? 'todo');
+																if (previous) void updateLocalItem(item.id, { stage: previous });
+															}}
+														>
+															<ArrowLeft class="size-3.5" />
+														</Button>
+														<Button
+															type="button"
+															variant="outline"
+															size="icon"
+															aria-label={`Move ${item.name} right`}
+															disabled={!nextStage(item.stage ?? 'todo')}
+															onclick={() => {
+																const next = nextStage(item.stage ?? 'todo');
+																if (next) void updateLocalItem(item.id, { stage: next });
+															}}
+														>
+															<ArrowRight class="size-3.5" />
+														</Button>
+														<Button
+															type="button"
+															variant="outline"
+															size="icon"
+															aria-label={`Delete ${item.name}`}
+															title="Delete"
+															onclick={() => requestDelete(item)}
+														>
+															<Trash2 class="size-3.5" />
+														</Button>
+													</div>
+												</div>
+
+												{#if item.lastError}
+													<p
+														class="rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+													>
+														{item.lastError}
+													</p>
+												{/if}
+											</Card.Content>
+										</Card.Root>
+									{/each}
 								{/if}
-							</Card.Content>
-						</Card.Root>
+							</div>
+						</section>
 					{/each}
-				{/if}
-			</div>
-		</section>
+				</div>
+			</Tabs.Content>
+		</Tabs.Root>
 
 		<aside class="space-y-4">
 			<Card.Root>

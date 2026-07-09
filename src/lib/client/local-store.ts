@@ -5,6 +5,7 @@ import { getClientId } from './identity';
 import { db } from './local-db';
 import type {
 	ClientSyncItem,
+	KanbanStage,
 	LocalItem,
 	MutationOperation,
 	OutboxMutation,
@@ -94,6 +95,7 @@ function toSyncItem(item: LocalItem): ClientSyncItem {
 		id: item.id,
 		name: item.name,
 		note: item.note,
+		stage: item.stage ?? 'todo',
 		updatedAt: item.updatedAt,
 		deletedAt: item.deletedAt
 	};
@@ -121,7 +123,7 @@ async function putLocalChange(item: LocalItem, op: MutationOperation) {
 	});
 }
 
-export async function addLocalItem(input: { name: string; note: string }) {
+export async function addLocalItem(input: { name: string; note: string; stage?: KanbanStage }) {
 	const now = Date.now();
 	const name = input.name.trim();
 	const note = input.note.trim();
@@ -132,6 +134,7 @@ export async function addLocalItem(input: { name: string; note: string }) {
 		id: crypto.randomUUID(),
 		name,
 		note,
+		stage: input.stage ?? 'todo',
 		revision: 0,
 		updatedAt: now,
 		deletedAt: null,
@@ -143,7 +146,10 @@ export async function addLocalItem(input: { name: string; note: string }) {
 	await putLocalChange(item, 'upsert');
 }
 
-export async function updateLocalItem(id: string, patch: Partial<Pick<LocalItem, 'name' | 'note'>>) {
+export async function updateLocalItem(
+	id: string,
+	patch: Partial<Pick<LocalItem, 'name' | 'note' | 'stage'>>
+) {
 	const existing = await db.items.get(id);
 	if (!existing || existing.deletedAt !== null) return;
 
@@ -152,6 +158,7 @@ export async function updateLocalItem(id: string, patch: Partial<Pick<LocalItem,
 		...patch,
 		name: patch.name ?? existing.name,
 		note: patch.note ?? existing.note,
+		stage: patch.stage ?? existing.stage ?? 'todo',
 		updatedAt: Date.now(),
 		sourceClientId: getClientId(),
 		syncStatus: 'pending',

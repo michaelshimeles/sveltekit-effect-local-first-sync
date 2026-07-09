@@ -4,6 +4,7 @@ import pg from 'pg';
 import type { RowDataPacket } from 'mysql2/promise';
 import type {
 	DatabaseMode,
+	KanbanStage,
 	ServerItem,
 	SyncChange,
 	SyncOutcome,
@@ -15,6 +16,11 @@ const { Pool } = pg;
 
 interface StoredItem extends ServerItem {
 	lastMutationId: string | null;
+}
+
+function normaliseStage(value: unknown): KanbanStage {
+	if (value === 'doing' || value === 'done') return value;
+	return 'todo';
 }
 
 export interface SyncStorage {
@@ -30,6 +36,7 @@ function normaliseIncoming(change: SyncChange): ServerItem {
 		id: change.item.id,
 		name: change.item.name.trim() || 'Untitled',
 		note: change.item.note,
+		stage: normaliseStage(change.item.stage),
 		revision: 0,
 		updatedAt: change.item.updatedAt || now,
 		deletedAt: change.op === 'delete' ? (change.item.deletedAt ?? now) : change.item.deletedAt,
@@ -42,6 +49,7 @@ function toServerItem(item: StoredItem): ServerItem {
 		id: item.id,
 		name: item.name,
 		note: item.note,
+		stage: normaliseStage(item.stage),
 		revision: item.revision,
 		updatedAt: item.updatedAt,
 		deletedAt: item.deletedAt,
@@ -126,12 +134,14 @@ create table if not exists sync_items (
 	id text primary key,
 	name text not null,
 	note text not null default '',
+	stage text not null default 'todo',
 	revision integer not null default 0,
 	updated_at bigint not null,
 	deleted_at bigint,
 	source_client_id text,
 	last_mutation_id text
 );
+alter table sync_items add column if not exists stage text not null default 'todo';
 create index if not exists sync_items_updated_at_idx on sync_items (updated_at desc);
 `;
 
@@ -140,6 +150,7 @@ function fromPostgresRow(row: Record<string, unknown>): StoredItem {
 		id: String(row.id),
 		name: String(row.name),
 		note: String(row.note ?? ''),
+		stage: normaliseStage(row.stage),
 		revision: Number(row.revision),
 		updatedAt: Number(row.updated_at),
 		deletedAt: row.deleted_at === null ? null : Number(row.deleted_at),
@@ -215,13 +226,14 @@ class PostgresStorage implements SyncStorage {
 				if (current) {
 					await client.query(
 						`update sync_items
-						 set name = $2, note = $3, revision = $4, updated_at = $5, deleted_at = $6,
-						 source_client_id = $7, last_mutation_id = $8
+						 set name = $2, note = $3, stage = $4, revision = $5, updated_at = $6, deleted_at = $7,
+						 source_client_id = $8, last_mutation_id = $9
 						 where id = $1`,
 						[
 							incoming.id,
 							incoming.name,
 							incoming.note,
+							incoming.stage,
 							nextRevision,
 							incoming.updatedAt,
 							incoming.deletedAt,
@@ -232,12 +244,13 @@ class PostgresStorage implements SyncStorage {
 				} else {
 					await client.query(
 						`insert into sync_items
-						 (id, name, note, revision, updated_at, deleted_at, source_client_id, last_mutation_id)
-						 values ($1, $2, $3, $4, $5, $6, $7, $8)`,
+						 (id, name, note, stage, revision, updated_at, deleted_at, source_client_id, last_mutation_id)
+						 values ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 						[
 							incoming.id,
 							incoming.name,
 							incoming.note,
+							incoming.stage,
 							nextRevision,
 							incoming.updatedAt,
 							incoming.deletedAt,
@@ -277,6 +290,7 @@ create table if not exists sync_items (
 	id varchar(64) primary key,
 	name text not null,
 	note text not null,
+	stage varchar(16) not null default 'todo',
 	revision int not null default 0,
 	updated_at bigint not null,
 	deleted_at bigint null,
@@ -290,6 +304,7 @@ type MySqlRow = RowDataPacket & {
 	id: string;
 	name: string;
 	note: string;
+	stage?: string | null;
 	revision: number;
 	updated_at: number | string;
 	deleted_at: number | string | null;
@@ -302,6 +317,7 @@ function fromMySqlRow(row: MySqlRow): StoredItem {
 		id: row.id,
 		name: row.name,
 		note: row.note ?? '',
+		stage: normaliseStage(row.stage),
 		revision: Number(row.revision),
 		updatedAt: Number(row.updated_at),
 		deletedAt: row.deleted_at === null ? null : Number(row.deleted_at),
@@ -322,6 +338,15 @@ class MySqlStorage implements SyncStorage {
 	private async ensureSchema() {
 		if (this.ready) return;
 		await this.pool.query(mysqlSchema);
+		try {
+			await this.pool.query(
+				`alter table sync_items add column stage varchar(16) not null default 'todo'`
+			);
+		} catch (error) {
+			if (!(error instanceof Error) || !/duplicate column/i.test(error.message)) {
+				throw error;
+			}
+		}
 		this.ready = true;
 	}
 
@@ -378,12 +403,13 @@ class MySqlStorage implements SyncStorage {
 				if (current) {
 					await connection.query(
 						`update sync_items
-						 set name = ?, note = ?, revision = ?, updated_at = ?, deleted_at = ?,
+						 set name = ?, note = ?, stage = ?, revision = ?, updated_at = ?, deleted_at = ?,
 						 source_client_id = ?, last_mutation_id = ?
 						 where id = ?`,
 						[
 							incoming.name,
 							incoming.note,
+							incoming.stage,
 							nextRevision,
 							incoming.updatedAt,
 							incoming.deletedAt,
@@ -395,12 +421,13 @@ class MySqlStorage implements SyncStorage {
 				} else {
 					await connection.query(
 						`insert into sync_items
-						 (id, name, note, revision, updated_at, deleted_at, source_client_id, last_mutation_id)
-						 values (?, ?, ?, ?, ?, ?, ?, ?)`,
+						 (id, name, note, stage, revision, updated_at, deleted_at, source_client_id, last_mutation_id)
+						 values (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 						[
 							incoming.id,
 							incoming.name,
 							incoming.note,
+							incoming.stage,
 							nextRevision,
 							incoming.updatedAt,
 							incoming.deletedAt,
