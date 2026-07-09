@@ -24,7 +24,7 @@
 	} from '$lib/client/local-store';
 	import { startSyncLoop, syncNow } from '$lib/client/sync-engine';
 	import type { LocalItem } from '$lib/shared/types';
-	import { cn } from '$lib/utils/cn';
+	import { cn } from '$lib/utils';
 
 	let name = $state('');
 	let note = $state('');
