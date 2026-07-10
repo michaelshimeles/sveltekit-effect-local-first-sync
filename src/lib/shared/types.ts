@@ -2,9 +2,11 @@ export type SyncStatus = 'synced' | 'pending' | 'error';
 export type MutationOperation = 'upsert' | 'delete';
 export type DatabaseMode = 'memory' | 'postgres' | 'mysql';
 export type KanbanStage = 'todo' | 'doing' | 'done';
+export type ReplicationCursor = string;
 
 export interface ServerItem {
 	id: string;
+	workspaceId: string;
 	name: string;
 	note: string;
 	stage: KanbanStage;
@@ -17,6 +19,7 @@ export interface ServerItem {
 export interface LocalItem extends ServerItem {
 	syncStatus: SyncStatus;
 	lastError: string | null;
+	snapshotId?: string | null;
 }
 
 export interface ClientSyncItem {
@@ -30,6 +33,7 @@ export interface ClientSyncItem {
 
 export interface OutboxMutation {
 	id: string;
+	workspaceId: string;
 	transactionId: string;
 	sequence: number;
 	itemId: string;
@@ -57,8 +61,19 @@ export interface SyncTransaction {
 	changes: ReadonlyArray<SyncChange>;
 }
 
+export interface SnapshotRequest {
+	id: string;
+	cursor: ReplicationCursor | null;
+	after: string | null;
+}
+
 export interface SyncRequest {
+	protocolVersion: 1 | 2;
 	clientId: string;
+	workspaceId: string;
+	cursor: ReplicationCursor | null;
+	snapshot: SnapshotRequest | null;
+	limit: number;
 	transactions: ReadonlyArray<SyncTransaction>;
 }
 
@@ -82,12 +97,44 @@ export interface SyncTransactionOutcome {
 	itemIds: string[];
 }
 
+export interface ReplicationCommit {
+	cursor: ReplicationCursor;
+	transactionId: string;
+	items: ServerItem[];
+}
+
+export interface SnapshotPage {
+	id: string;
+	cursor: ReplicationCursor;
+	items: ServerItem[];
+	after: string | null;
+	hasMore: boolean;
+}
+
+export interface SyncResponseStats {
+	transactionsProcessed: number;
+	commitsReturned: number;
+	itemsReturned: number;
+	compactedCommits?: number;
+}
+
 export interface SyncResponse {
+	protocolVersion: 1 | 2;
 	serverTime: number;
 	databaseMode: DatabaseMode;
+	workspaceId: string;
+	cursor: ReplicationCursor | null;
+	latestCursor: ReplicationCursor;
+	hasMore: boolean;
+	resetRequired: boolean;
+	commits: ReplicationCommit[];
+	snapshot: SnapshotPage | null;
 	transactions: SyncTransactionOutcome[];
 	applied: SyncOutcome[];
-	items: ServerItem[];
+	reconciledItemIds: string[];
+	reconciledItems: ServerItem[];
+	stats: SyncResponseStats;
+	items?: ServerItem[];
 }
 
 export interface SyncActivity {

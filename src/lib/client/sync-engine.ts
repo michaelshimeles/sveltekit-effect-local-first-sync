@@ -1,12 +1,23 @@
 import { browser } from '$app/environment';
 import { liveQuery } from 'dexie';
-import { getClientId } from './identity';
+import { getClientId, getWorkspaceId } from './identity';
 import { db } from './local-db';
 import { markOutboxFailed, realtimeActivity, syncActivity } from './local-store';
+import {
+	DEFAULT_SYNC_PAGE_LIMIT,
+	MAX_CHANGES_PER_REQUEST,
+	MAX_SYNC_TRANSACTIONS,
+	SYNC_PROTOCOL_VERSION,
+	compareReplicationCursors,
+	workspaceMetaKey
+} from '$lib/shared/replication';
 import type {
 	LocalItem,
 	OutboxMutation,
+	ReplicationCommit,
 	ServerItem,
+	SnapshotPage,
+	SnapshotRequest,
 	SyncResponse,
 	SyncTransaction
 } from '$lib/shared/types';
@@ -16,15 +27,23 @@ let queuedSyncReason: SyncReason | null = null;
 let scheduledSyncReason: SyncReason | null = null;
 let scheduledSyncTimer: number | null = null;
 
-type SyncReason = 'manual' | 'interval' | 'online' | 'startup' | 'realtime' | 'local';
+type SyncReason =
+	| 'manual'
+	| 'interval'
+	| 'online'
+	| 'startup'
+	| 'realtime'
+	| 'local'
+	| 'catchup';
 
 const reasonPriority: Record<SyncReason, number> = {
 	interval: 0,
 	startup: 1,
-	online: 2,
-	realtime: 3,
-	local: 4,
-	manual: 5
+	catchup: 2,
+	online: 3,
+	realtime: 4,
+	local: 5,
+	manual: 6
 };
 
 function preferredReason(current: SyncReason | null, next: SyncReason) {
@@ -37,62 +56,47 @@ function syncMessage(reason: SyncReason) {
 	if (reason === 'local') return 'Syncing local changes';
 	if (reason === 'realtime') return 'Realtime change received';
 	if (reason === 'online') return 'Back online, syncing';
+	if (reason === 'catchup') return 'Catching up';
 	return 'Background sync';
 }
 
-function toLocalItem(item: ServerItem): LocalItem {
+function toLocalItem(item: ServerItem, snapshotId: string | null = null): LocalItem {
 	return {
 		...item,
 		syncStatus: 'synced',
-		lastError: null
+		lastError: null,
+		snapshotId
 	};
 }
 
-async function mergeServerItems(items: ServerItem[], sent: OutboxMutation[], response: SyncResponse) {
-	const completedMutationIds = new Set(response.applied.map((outcome) => outcome.mutationId));
-	const completedTransactionIds = new Set(
-		(response.transactions ?? []).map((outcome) => outcome.transactionId)
-	);
-	const serverItemIds = new Set(items.map((item) => item.id));
+interface StoredSnapshotState extends SnapshotRequest {}
 
-	await db.transaction('rw', db.items, db.outbox, async () => {
-		if (completedTransactionIds.size > 0) {
-			await db.outbox.where('transactionId').anyOf([...completedTransactionIds]).delete();
+async function readReplicationState(workspaceId: string) {
+	const cursor = (await db.meta.get(workspaceMetaKey(workspaceId, 'cursor')))?.value ?? null;
+	const snapshotValue = (await db.meta.get(workspaceMetaKey(workspaceId, 'snapshot')))?.value;
+	let snapshot: StoredSnapshotState | null = null;
+
+	if (snapshotValue) {
+		try {
+			snapshot = JSON.parse(snapshotValue) as StoredSnapshotState;
+		} catch {
+			await db.meta.delete(workspaceMetaKey(workspaceId, 'snapshot'));
 		}
-		await Promise.all([...completedMutationIds].map((id) => db.outbox.delete(id)));
+	}
 
-		const stillPending = await db.outbox.toArray();
-		const pendingItemIds = new Set(stillPending.map((mutation) => mutation.itemId));
-		const sentItemIds = new Set(sent.map((mutation) => mutation.itemId));
+	if (cursor !== null) return { cursor, snapshot: null };
+	if (snapshot) return { cursor: null, snapshot };
 
-		for (const item of items) {
-			if (pendingItemIds.has(item.id)) continue;
-
-			if (item.deletedAt !== null) {
-				await db.items.delete(item.id);
-				continue;
-			}
-
-			const local = await db.items.get(item.id);
-			const localIsNewer = local && sentItemIds.has(item.id) && local.updatedAt > item.updatedAt;
-			if (localIsNewer) continue;
-
-			await db.items.put(toLocalItem(item));
-		}
-
-		const localRows = await db.items.toArray();
-		await Promise.all(
-			localRows.map(async (item) => {
-				if (
-					item.syncStatus === 'synced' &&
-					!serverItemIds.has(item.id) &&
-					!pendingItemIds.has(item.id)
-				) {
-					await db.items.delete(item.id);
-				}
-			})
-		);
+	const next: StoredSnapshotState = {
+		id: crypto.randomUUID(),
+		cursor: null,
+		after: null
+	};
+	await db.meta.put({
+		key: workspaceMetaKey(workspaceId, 'snapshot'),
+		value: JSON.stringify(next)
 	});
+	return { cursor: null, snapshot: next };
 }
 
 function groupTransactions(queued: OutboxMutation[]): SyncTransaction[] {
@@ -107,16 +111,11 @@ function groupTransactions(queued: OutboxMutation[]): SyncTransaction[] {
 			createdAt: mutation.createdAt,
 			changes: []
 		};
-
 		groups.set(mutation.transactionId, {
 			...transaction,
 			changes: [
 				...transaction.changes,
-				{
-					mutationId: mutation.id,
-					op: mutation.op,
-					item: mutation.item
-				}
+				{ mutationId: mutation.id, op: mutation.op, item: mutation.item }
 			]
 		});
 	}
@@ -124,15 +123,197 @@ function groupTransactions(queued: OutboxMutation[]): SyncTransaction[] {
 	return [...groups.values()];
 }
 
-export function requestSync(reason: SyncReason = 'local', delay = 25) {
-	if (!browser) return;
+function selectTransactionBatch(queued: OutboxMutation[]) {
+	const transactions = groupTransactions(queued);
+	const selected: SyncTransaction[] = [];
+	let changes = 0;
 
-	scheduledSyncReason = preferredReason(scheduledSyncReason, reason);
-
-	if (scheduledSyncTimer !== null) {
-		window.clearTimeout(scheduledSyncTimer);
+	for (const transaction of transactions) {
+		if (selected.length >= MAX_SYNC_TRANSACTIONS) break;
+		if (selected.length > 0 && changes + transaction.changes.length > MAX_CHANGES_PER_REQUEST) break;
+		selected.push(transaction);
+		changes += transaction.changes.length;
 	}
 
+	const transactionIds = new Set(selected.map((transaction) => transaction.id));
+	return {
+		transactions: selected,
+		sent: queued.filter((mutation) => transactionIds.has(mutation.transactionId)),
+		hasMore: selected.length < transactions.length
+	};
+}
+
+async function deleteCompletedOutbox(
+	workspaceId: string,
+	response: SyncResponse,
+	sent: OutboxMutation[]
+) {
+	const completedTransactionIds = new Set(
+		(response.transactions ?? []).map((outcome) => outcome.transactionId)
+	);
+	const completedMutationIds = new Set(response.applied.map((outcome) => outcome.mutationId));
+
+	for (const transactionId of completedTransactionIds) {
+		await db.workspaceOutbox
+			.where('[workspaceId+transactionId]')
+			.equals([workspaceId, transactionId])
+			.delete();
+	}
+	for (const mutation of sent) {
+		if (completedMutationIds.has(mutation.id)) {
+			await db.workspaceOutbox.delete([workspaceId, mutation.id]);
+		}
+	}
+}
+
+async function applyAuthoritativeItem(
+	workspaceId: string,
+	item: ServerItem,
+	pendingItemIds: Set<string>,
+	snapshotId: string | null = null
+) {
+	if (pendingItemIds.has(item.id)) {
+		if (snapshotId) {
+			await db.workspaceItems.update([workspaceId, item.id], { snapshotId });
+		}
+		return;
+	}
+
+	if (item.deletedAt !== null) {
+		await db.workspaceItems.delete([workspaceId, item.id]);
+		return;
+	}
+
+	await db.workspaceItems.put(toLocalItem(item, snapshotId));
+}
+
+async function applySnapshot(
+	workspaceId: string,
+	snapshot: SnapshotPage,
+	pendingItemIds: Set<string>
+) {
+	for (const item of snapshot.items) {
+		await applyAuthoritativeItem(workspaceId, item, pendingItemIds, snapshot.id);
+	}
+
+	if (snapshot.hasMore) {
+		const nextState: StoredSnapshotState = {
+			id: snapshot.id,
+			cursor: snapshot.cursor,
+			after: snapshot.after
+		};
+		await db.meta.put({
+			key: workspaceMetaKey(workspaceId, 'snapshot'),
+			value: JSON.stringify(nextState)
+		});
+		return;
+	}
+
+	const rows = await db.workspaceItems.where('workspaceId').equals(workspaceId).toArray();
+	for (const item of rows) {
+		if (pendingItemIds.has(item.id)) continue;
+		if (item.snapshotId !== snapshot.id) {
+			await db.workspaceItems.delete([workspaceId, item.id]);
+		} else {
+			await db.workspaceItems.update([workspaceId, item.id], { snapshotId: null });
+		}
+	}
+	await db.meta.put({ key: workspaceMetaKey(workspaceId, 'cursor'), value: snapshot.cursor });
+	await db.meta.delete(workspaceMetaKey(workspaceId, 'snapshot'));
+}
+
+async function applyCommits(
+	workspaceId: string,
+	commits: ReplicationCommit[],
+	cursor: string | null,
+	pendingItemIds: Set<string>
+) {
+	for (const commit of commits) {
+		for (const item of commit.items) {
+			await applyAuthoritativeItem(workspaceId, item, pendingItemIds);
+		}
+	}
+
+	if (cursor !== null) {
+		await db.meta.put({ key: workspaceMetaKey(workspaceId, 'cursor'), value: cursor });
+	}
+}
+
+async function applyReconciliation(
+	workspaceId: string,
+	response: SyncResponse,
+	pendingItemIds: Set<string>
+) {
+	const items = new Map(response.reconciledItems.map((item) => [item.id, item]));
+	for (const itemId of response.reconciledItemIds) {
+		if (pendingItemIds.has(itemId)) continue;
+		const item = items.get(itemId);
+		if (!item || item.deletedAt !== null) {
+			await db.workspaceItems.delete([workspaceId, itemId]);
+		} else {
+			await db.workspaceItems.put(toLocalItem(item));
+		}
+	}
+}
+
+async function applyLegacySnapshot(
+	workspaceId: string,
+	items: ServerItem[],
+	pendingItemIds: Set<string>
+) {
+	const serverIds = new Set(items.map((item) => item.id));
+	for (const item of items) {
+		await applyAuthoritativeItem(workspaceId, item, pendingItemIds);
+	}
+	const rows = await db.workspaceItems.where('workspaceId').equals(workspaceId).toArray();
+	for (const item of rows) {
+		if (item.syncStatus === 'synced' && !serverIds.has(item.id) && !pendingItemIds.has(item.id)) {
+			await db.workspaceItems.delete([workspaceId, item.id]);
+		}
+	}
+}
+
+async function mergeSyncResponse(
+	workspaceId: string,
+	response: SyncResponse,
+	sent: OutboxMutation[]
+) {
+	await db.transaction(
+		'rw',
+		db.workspaceItems,
+		db.workspaceOutbox,
+		db.meta,
+		async () => {
+			if (response.resetRequired) {
+				await db.meta.delete(workspaceMetaKey(workspaceId, 'cursor'));
+				await db.meta.delete(workspaceMetaKey(workspaceId, 'snapshot'));
+				return;
+			}
+
+			await deleteCompletedOutbox(workspaceId, response, sent);
+			const pending = await db.workspaceOutbox
+				.where('workspaceId')
+				.equals(workspaceId)
+				.toArray();
+			const pendingItemIds = new Set(pending.map((mutation) => mutation.itemId));
+
+			await applyReconciliation(workspaceId, response, pendingItemIds);
+			if (response.protocolVersion === 1 && response.items) {
+				await applyLegacySnapshot(workspaceId, response.items, pendingItemIds);
+				return;
+			}
+			if (response.snapshot) {
+				await applySnapshot(workspaceId, response.snapshot, pendingItemIds);
+			}
+			await applyCommits(workspaceId, response.commits, response.cursor, pendingItemIds);
+		}
+	);
+}
+
+export function requestSync(reason: SyncReason = 'local', delay = 25) {
+	if (!browser) return;
+	scheduledSyncReason = preferredReason(scheduledSyncReason, reason);
+	if (scheduledSyncTimer !== null) window.clearTimeout(scheduledSyncTimer);
 	scheduledSyncTimer = window.setTimeout(() => {
 		const nextReason = scheduledSyncReason ?? reason;
 		scheduledSyncTimer = null;
@@ -143,18 +324,15 @@ export function requestSync(reason: SyncReason = 'local', delay = 25) {
 
 export async function syncNow(reason: SyncReason = 'manual') {
 	if (!browser) return;
-
 	if (scheduledSyncTimer !== null) {
 		window.clearTimeout(scheduledSyncTimer);
 		scheduledSyncTimer = null;
 		scheduledSyncReason = null;
 	}
-
 	if (syncInFlight) {
 		queuedSyncReason = preferredReason(queuedSyncReason, reason);
 		return;
 	}
-
 	if (!navigator.onLine) {
 		syncActivity.set({
 			status: 'offline',
@@ -175,43 +353,61 @@ export async function syncNow(reason: SyncReason = 'manual') {
 	}));
 
 	try {
-		const queued = await db.outbox.orderBy('createdAt').toArray();
-		const transactions = groupTransactions(queued);
+		const workspaceId = getWorkspaceId();
+		const replication = await readReplicationState(workspaceId);
+		const queued = await db.workspaceOutbox
+			.where('workspaceId')
+			.equals(workspaceId)
+			.sortBy('createdAt');
+		const batch = replication.cursor === null
+			? { transactions: [], sent: [], hasMore: queued.length > 0 }
+			: selectTransactionBatch(queued);
 
 		const response = await fetch('/api/sync', {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
 			body: JSON.stringify({
+				protocolVersion: SYNC_PROTOCOL_VERSION,
 				clientId: getClientId(),
-				transactions
+				workspaceId,
+				cursor: replication.cursor,
+				snapshot: replication.snapshot,
+				limit: DEFAULT_SYNC_PAGE_LIMIT,
+				transactions: batch.transactions
 			})
 		});
-
 		if (!response.ok) {
 			const body = await response.text();
 			throw new Error(body || `Sync failed with ${response.status}`);
 		}
 
 		const payload = (await response.json()) as SyncResponse;
-		await mergeServerItems(payload.items, queued, payload);
-
+		await mergeSyncResponse(workspaceId, payload, batch.sent);
 		const appliedCount = payload.applied.filter((outcome) => outcome.status !== 'conflict').length;
 		const conflictCount = payload.applied.filter((outcome) => outcome.status === 'conflict').length;
+		const localCursor = (await db.meta.get(workspaceMetaKey(workspaceId, 'cursor')))?.value ?? null;
+		const needsCatchup =
+			payload.resetRequired ||
+			payload.hasMore ||
+			batch.hasMore ||
+			(localCursor !== null && compareReplicationCursors(localCursor, payload.latestCursor) < 0);
 
 		syncActivity.set({
 			status: 'synced',
 			lastSyncedAt: Date.now(),
 			lastMessage:
 				queued.length === 0
-					? 'Pulled latest server state'
+					? payload.hasMore
+						? 'Applying server changes'
+						: 'Server state current'
 					: `${appliedCount} synced${conflictCount ? `, ${conflictCount} reconciled` : ''}`,
 			error: null,
 			databaseMode: payload.databaseMode
 		});
+		if (needsCatchup) requestSync('catchup', 0);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : 'Sync failed';
 		await markOutboxFailed(message);
-
 		syncActivity.update((state) => ({
 			...state,
 			status: 'error',
@@ -220,7 +416,6 @@ export async function syncNow(reason: SyncReason = 'manual') {
 		}));
 	} finally {
 		syncInFlight = false;
-
 		if (queuedSyncReason) {
 			const nextReason = queuedSyncReason;
 			queuedSyncReason = null;
@@ -232,12 +427,12 @@ export async function syncNow(reason: SyncReason = 'manual') {
 function realtimeUrl() {
 	const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
 	const clientId = encodeURIComponent(getClientId());
-	return `${protocol}//${window.location.host}/api/realtime?clientId=${clientId}`;
+	const workspaceId = encodeURIComponent(getWorkspaceId());
+	return `${protocol}//${window.location.host}/api/realtime?clientId=${clientId}&workspaceId=${workspaceId}`;
 }
 
 function startRealtimeConnection() {
 	if (!browser) return () => {};
-
 	let socket: WebSocket | null = null;
 	let reconnectTimer: number | null = null;
 	let stopped = false;
@@ -246,7 +441,6 @@ function startRealtimeConnection() {
 
 	const scheduleReconnect = () => {
 		if (stopped || reconnectTimer !== null) return;
-
 		const delay = Math.min(1000 * 2 ** reconnectAttempt, 15000);
 		reconnectAttempt += 1;
 		realtimeActivity.set({
@@ -255,7 +449,6 @@ function startRealtimeConnection() {
 			lastMessageAt: null,
 			message: `Realtime reconnecting in ${Math.round(delay / 1000)}s`
 		});
-
 		reconnectTimer = window.setTimeout(() => {
 			reconnectTimer = null;
 			connect();
@@ -264,15 +457,12 @@ function startRealtimeConnection() {
 
 	const connect = () => {
 		if (stopped) return;
-
 		realtimeActivity.update((state) => ({
 			...state,
 			status: 'connecting',
 			message: 'Connecting realtime'
 		}));
-
 		socket = new WebSocket(realtimeUrl());
-
 		socket.addEventListener('open', () => {
 			reconnectAttempt = 0;
 			realtimeActivity.set({
@@ -283,49 +473,42 @@ function startRealtimeConnection() {
 			});
 			requestSync('online', 0);
 		});
-
 		socket.addEventListener('message', (event) => {
 			if (typeof event.data !== 'string') return;
-
 			try {
 				const message = JSON.parse(event.data) as {
 					type?: string;
 					id?: string;
 					sourceClientId?: string;
+					workspaceId?: string;
+					cursor?: string;
 				};
-
 				if (message.type === 'connected') return;
-				if (message.type !== 'sync_changed' || !message.id) return;
-				if (seenMessages.has(message.id)) return;
-
+				if (
+					message.type !== 'sync_changed' ||
+					!message.id ||
+					message.workspaceId !== getWorkspaceId() ||
+					seenMessages.has(message.id)
+				) return;
 				seenMessages.add(message.id);
-				if (seenMessages.size > 200) {
-					seenMessages.clear();
-				}
-
+				if (seenMessages.size > 200) seenMessages.clear();
 				realtimeActivity.update((state) => ({
 					...state,
 					status: 'connected',
 					lastMessageAt: Date.now(),
-					message:
-						message.sourceClientId === getClientId()
-							? 'Realtime confirmed local sync'
-							: 'Realtime change received'
+					message: message.sourceClientId === getClientId()
+						? 'Realtime confirmed local sync'
+						: 'Realtime change received'
 				}));
-
-				if (message.sourceClientId !== getClientId()) {
-					requestSync('realtime', 0);
-				}
+				if (message.sourceClientId !== getClientId()) requestSync('realtime', 0);
 			} catch (error) {
 				console.error('Invalid realtime message', error);
 			}
 		});
-
 		socket.addEventListener('close', () => {
 			socket = null;
 			scheduleReconnect();
 		});
-
 		socket.addEventListener('error', () => {
 			realtimeActivity.update((state) => ({
 				...state,
@@ -337,21 +520,20 @@ function startRealtimeConnection() {
 	};
 
 	connect();
-
 	return () => {
 		stopped = true;
-		if (reconnectTimer !== null) {
-			window.clearTimeout(reconnectTimer);
-		}
+		if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
 		socket?.close();
 	};
 }
 
 function startLocalOutboxSync() {
 	let lastSignature: string | null = null;
-
 	const subscription = liveQuery(async () => {
-		const rows = await db.outbox.orderBy('createdAt').toArray();
+		const rows = await db.workspaceOutbox
+			.where('workspaceId')
+			.equals(getWorkspaceId())
+			.sortBy('createdAt');
 		return rows.map((mutation) => `${mutation.id}:${mutation.createdAt}`).join('|');
 	}).subscribe({
 		next(signature) {
@@ -360,9 +542,7 @@ function startLocalOutboxSync() {
 				if (signature) requestSync('startup', 0);
 				return;
 			}
-
 			if (signature === lastSignature) return;
-
 			lastSignature = signature;
 			if (signature) requestSync('local', 25);
 		},
@@ -370,26 +550,22 @@ function startLocalOutboxSync() {
 			console.error('Outbox sync watcher failed', error);
 		}
 	});
-
 	return () => subscription.unsubscribe();
 }
 
 export function startSyncLoop() {
 	if (!browser) return () => {};
-
 	const sync = (reason: 'interval' | 'online') => requestSync(reason, 0);
-	const interval = window.setInterval(() => sync('interval'), 4000);
+	const interval = window.setInterval(() => sync('interval'), 15000);
 	const stopRealtime = startRealtimeConnection();
 	const stopOutboxSync = startLocalOutboxSync();
 	const onlineHandler = () => sync('online');
 	const visibilityHandler = () => {
 		if (document.visibilityState === 'visible') sync('interval');
 	};
-
 	window.addEventListener('online', onlineHandler);
 	document.addEventListener('visibilitychange', visibilityHandler);
 	void syncNow('startup');
-
 	return () => {
 		window.clearInterval(interval);
 		stopRealtime();

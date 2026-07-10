@@ -10,6 +10,7 @@
 		"preview": "vite preview",
 		"test": "node --test tests/*.test.ts",
 		"verify:transactions": "node scripts/verify-transaction-api.mjs",
+		"verify:replication": "node scripts/verify-replication-api.mjs",
 		"prepare": "svelte-kit sync || echo ''",
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
 		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch"

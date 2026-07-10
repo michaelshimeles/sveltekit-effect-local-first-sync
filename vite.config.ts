@@ -11,13 +11,17 @@ function realtimeWebSocketPlugin(options: { listenDatabaseUrl?: string } = {}): 
 			if (!server.httpServer) return;
 
 			const wss = new WebSocketServer({ noServer: true });
+			const socketWorkspaces = new WeakMap<WebSocket, string>();
 			let unsubscribePromise: Promise<(() => void | Promise<void>) | null> | null = null;
 
 			const broadcast = (message: RealtimeSyncMessage) => {
 				const payload = JSON.stringify(message);
 
 				for (const client of wss.clients) {
-					if (client.readyState === WebSocket.OPEN) {
+					if (
+						client.readyState === WebSocket.OPEN &&
+						socketWorkspaces.get(client) === message.workspaceId
+					) {
 						client.send(payload);
 					}
 				}
@@ -39,8 +43,11 @@ function realtimeWebSocketPlugin(options: { listenDatabaseUrl?: string } = {}): 
 				});
 			});
 
-			wss.on('connection', (socket) => {
-				socket.send(JSON.stringify({ type: 'connected', serverTime: Date.now() }));
+			wss.on('connection', (socket, request) => {
+				const url = new URL(request.url ?? '/api/realtime', 'http://localhost');
+				const workspaceId = url.searchParams.get('workspaceId') || 'default';
+				socketWorkspaces.set(socket, workspaceId);
+				socket.send(JSON.stringify({ type: 'connected', workspaceId, serverTime: Date.now() }));
 			});
 
 			server.httpServer.on('close', async () => {

@@ -5,6 +5,7 @@ import type {
 	SyncTransaction,
 	SyncTransactionOutcome
 } from '$lib/shared/types';
+import { DEFAULT_WORKSPACE_ID } from '../shared/replication.ts';
 
 export type TerminalTransactionStatus = 'applied' | 'conflict';
 
@@ -35,6 +36,7 @@ export function normaliseStage(value: unknown): KanbanStage {
 export function toServerItem(item: StoredSyncItem): ServerItem {
 	return {
 		id: item.id,
+		workspaceId: item.workspaceId,
 		name: item.name,
 		note: item.note,
 		stage: normaliseStage(item.stage),
@@ -88,6 +90,7 @@ export function validateSyncTransaction(transaction: SyncTransaction) {
 }
 
 function normaliseIncoming(
+	workspaceId: string,
 	transaction: SyncTransaction,
 	change: SyncTransaction['changes'][number]
 ): ServerItem {
@@ -95,6 +98,7 @@ function normaliseIncoming(
 
 	return {
 		id: change.item.id,
+		workspaceId,
 		name: change.item.name.trim() || 'Untitled',
 		note: change.item.note,
 		stage: normaliseStage(change.item.stage),
@@ -153,11 +157,18 @@ function buildResult(
 
 export function planSyncTransaction(input: {
 	clientId: string;
+	workspaceId?: string;
 	transaction: SyncTransaction;
 	currentItems: ReadonlyMap<string, StoredSyncItem>;
 	terminalStatus?: TerminalTransactionStatus | null;
 }): TransactionPlan {
-	const { clientId, transaction, currentItems, terminalStatus = null } = input;
+	const {
+		clientId,
+		workspaceId = DEFAULT_WORKSPACE_ID,
+		transaction,
+		currentItems,
+		terminalStatus = null
+	} = input;
 	validateSyncTransaction(transaction);
 
 	if (terminalStatus) {
@@ -183,7 +194,7 @@ export function planSyncTransaction(input: {
 
 	const incoming = transaction.changes.map((change) => ({
 		change,
-		item: normaliseIncoming(transaction, change)
+		item: normaliseIncoming(workspaceId, transaction, change)
 	}));
 	const hasConflict = incoming.some(({ change, item }) => {
 		const current = currentItems.get(item.id);

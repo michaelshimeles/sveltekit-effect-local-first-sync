@@ -1,7 +1,7 @@
 import { browser } from '$app/environment';
 import { liveQuery } from 'dexie';
 import { derived, readable, writable } from 'svelte/store';
-import { getClientId } from './identity';
+import { getClientId, getWorkspaceId } from './identity';
 import { db } from './local-db';
 import {
 	runLocalTransaction,
@@ -19,12 +19,21 @@ import type {
 
 export type { ItemPatch, LocalTransactionContext, LocalTransactionResult } from './local-transaction';
 
-function dexieReadable<T>(query: () => Promise<T>, initialValue: T) {
+export const localHydrated = writable(false);
+
+function dexieReadable<T>(query: () => Promise<T>, initialValue: T, onFirstValue?: () => void) {
 	if (!browser) return readable(initialValue);
 
 	return readable(initialValue, (set) => {
+		let first = true;
 		const subscription = liveQuery(query).subscribe({
-			next: set,
+			next(value) {
+				set(value);
+				if (first) {
+					first = false;
+					onFirstValue?.();
+				}
+			},
 			error: (error) => console.error('Dexie live query failed', error)
 		});
 
@@ -34,22 +43,35 @@ function dexieReadable<T>(query: () => Promise<T>, initialValue: T) {
 
 export const localItems = dexieReadable<LocalItem[]>(
 	async () => {
-		const rows = await db.items.orderBy('updatedAt').reverse().toArray();
+		const rows = await db.workspaceItems
+			.where('workspaceId')
+			.equals(getWorkspaceId())
+			.sortBy('updatedAt');
+		rows.reverse();
 		return rows.filter((item) => item.deletedAt === null);
 	},
-	[]
+	[],
+	() => localHydrated.set(true)
 );
 
 export const tombstones = dexieReadable<LocalItem[]>(
 	async () => {
-		const rows = await db.items.orderBy('updatedAt').reverse().toArray();
+		const rows = await db.workspaceItems
+			.where('workspaceId')
+			.equals(getWorkspaceId())
+			.sortBy('updatedAt');
+		rows.reverse();
 		return rows.filter((item) => item.deletedAt !== null);
 	},
 	[]
 );
 
 export const outboxItems = dexieReadable<OutboxMutation[]>(
-	() => db.outbox.orderBy('createdAt').toArray(),
+	() =>
+		db.workspaceOutbox
+			.where('workspaceId')
+			.equals(getWorkspaceId())
+			.sortBy('createdAt'),
 	[]
 );
 
@@ -99,7 +121,10 @@ export const localSummary = derived(
 export async function localTransaction<T>(
 	handler: (transaction: LocalTransactionContext) => T | Promise<T>
 ): Promise<LocalTransactionResult<T>> {
-	return runLocalTransaction({ db, clientId: getClientId() }, handler);
+	return runLocalTransaction(
+		{ db, clientId: getClientId(), workspaceId: getWorkspaceId() },
+		handler
+	);
 }
 
 export async function addLocalItem(input: { name: string; note: string; stage?: KanbanStage }) {
@@ -123,16 +148,20 @@ export async function deleteLocalItem(id: string) {
 }
 
 export async function markOutboxFailed(message: string) {
-	await db.transaction('rw', db.items, db.outbox, async () => {
-		const pending = await db.outbox.toArray();
+	const workspaceId = getWorkspaceId();
+	await db.transaction('rw', db.workspaceItems, db.workspaceOutbox, async () => {
+		const pending = await db.workspaceOutbox
+			.where('workspaceId')
+			.equals(workspaceId)
+			.toArray();
 
 		await Promise.all(
 			pending.map(async (mutation) => {
-				await db.outbox.update(mutation.id, {
+				await db.workspaceOutbox.update([workspaceId, mutation.id], {
 					attempts: mutation.attempts + 1,
 					lastError: message
 				});
-				await db.items.update(mutation.itemId, {
+				await db.workspaceItems.update([workspaceId, mutation.itemId], {
 					syncStatus: 'error',
 					lastError: message
 				});

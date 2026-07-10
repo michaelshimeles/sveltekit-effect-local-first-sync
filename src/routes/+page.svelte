@@ -32,6 +32,7 @@
 		addLocalItem,
 		deleteLocalItem,
 		localItems,
+		localHydrated,
 		localSummary,
 		outboxItems,
 		realtimeActivity,
@@ -341,7 +342,9 @@
 							<p class="text-xs font-medium text-muted-foreground">Local records</p>
 							<HardDrive class="size-4 text-muted-foreground" />
 						</div>
-						<p class="mt-2 text-2xl font-semibold tabular-nums">{$localSummary.total}</p>
+						<p class="mt-2 text-2xl font-semibold tabular-nums">
+							{#if $localHydrated}{$localSummary.total}{:else}<span class="inline-block h-7 w-8 animate-pulse rounded bg-muted"></span>{/if}
+						</p>
 					</Card.Content>
 				</Card.Root>
 
@@ -411,7 +414,12 @@
 					</Card.Header>
 					<Card.Content class="space-y-4">
 						<div class="max-h-[52rem] space-y-3 overflow-y-auto rounded-md bg-muted/30 p-3">
-							{#if $localItems.length === 0}
+							{#if !$localHydrated}
+								<div class="space-y-3" aria-hidden="true">
+									<div class="h-20 animate-pulse rounded-md bg-muted"></div>
+									<div class="h-16 animate-pulse rounded-md bg-muted"></div>
+								</div>
+							{:else if $localItems.length === 0}
 								<div class="rounded-md border border-dashed bg-background px-4 py-8 text-center">
 									<p class="text-sm font-medium">No messages yet</p>
 									<p class="mt-1 text-xs text-muted-foreground">
@@ -546,7 +554,9 @@
 								ondragleave={(event) => handleColumnDragLeave(event, stage.id)}
 								ondrop={(event) => handleColumnDrop(event, stage.id)}
 							>
-								{#if stageItems($localItems, stage.id).length === 0}
+								{#if !$localHydrated}
+									<div class="h-24 animate-pulse rounded-md bg-muted" aria-hidden="true"></div>
+								{:else if stageItems($localItems, stage.id).length === 0}
 									<div
 										class={cn(
 											'grid min-h-28 place-items-center rounded-md border border-dashed bg-background/60 px-3 py-6 text-center',

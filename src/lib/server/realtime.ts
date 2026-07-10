@@ -10,6 +10,8 @@ export interface RealtimeSyncMessage {
 	type: 'sync_changed';
 	id: string;
 	sourceClientId: string;
+	workspaceId: string;
+	cursor: string;
 	itemIds: string[];
 	databaseMode: DatabaseMode;
 	serverTime: number;

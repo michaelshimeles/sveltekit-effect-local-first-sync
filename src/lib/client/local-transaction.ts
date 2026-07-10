@@ -38,6 +38,7 @@ interface StagedChange {
 interface LocalTransactionOptions {
 	db: LocalFirstDatabase;
 	clientId: string;
+	workspaceId: string;
 	createId?: () => string;
 	now?: () => number;
 }
@@ -63,6 +64,7 @@ function createMutation(input: {
 }): OutboxMutation {
 	return {
 		id: input.createId(),
+		workspaceId: input.item.workspaceId,
 		transactionId: input.transactionId,
 		sequence: input.sequence,
 		itemId: input.item.id,
@@ -74,15 +76,24 @@ function createMutation(input: {
 	};
 }
 
-async function compactSingleItemTransactions(db: LocalFirstDatabase, itemId: string) {
-	const pending = await db.outbox.where('itemId').equals(itemId).toArray();
+async function compactSingleItemTransactions(
+	db: LocalFirstDatabase,
+	workspaceId: string,
+	itemId: string
+) {
+	const pending = await db.workspaceOutbox
+		.where('[workspaceId+itemId]')
+		.equals([workspaceId, itemId])
+		.toArray();
 
 	for (const mutation of pending) {
-		const transactionSize = await db.outbox
-			.where('transactionId')
-			.equals(mutation.transactionId)
+		const transactionSize = await db.workspaceOutbox
+			.where('[workspaceId+transactionId]')
+			.equals([workspaceId, mutation.transactionId])
 			.count();
-		if (transactionSize === 1) await db.outbox.delete(mutation.id);
+		if (transactionSize === 1) {
+			await db.workspaceOutbox.delete([workspaceId, mutation.id]);
+		}
 	}
 }
 
@@ -96,13 +107,14 @@ export async function runLocalTransaction<T>(
 
 	return options.db.transaction(
 		'rw',
-		options.db.items,
-		options.db.outbox,
+		options.db.workspaceItems,
+		options.db.workspaceOutbox,
 		options.db.meta,
 		async () => {
-			const previousClock = Number((await options.db.meta.get('transaction-clock'))?.value ?? 0);
+			const clockKey = `transaction-clock:${options.workspaceId}`;
+			const previousClock = Number((await options.db.meta.get(clockKey))?.value ?? 0);
 			const createdAt = Math.max(now(), previousClock + 1);
-			await options.db.meta.put({ key: 'transaction-clock', value: String(createdAt) });
+			await options.db.meta.put({ key: clockKey, value: String(createdAt) });
 			const originals = new Map<string, LocalItem | undefined>();
 			const staged = new Map<string, StagedChange>();
 			let nextSequence = 0;
@@ -113,7 +125,7 @@ export async function runLocalTransaction<T>(
 				if (pending) return pending.item;
 				if (originals.has(id)) return originals.get(id);
 
-				const item = await options.db.items.get(id);
+				const item = await options.db.workspaceItems.get([options.workspaceId, id]);
 				originals.set(id, item);
 				return item;
 			};
@@ -136,7 +148,14 @@ export async function runLocalTransaction<T>(
 				id: transactionId,
 				get: read,
 				list: async (listOptions = {}) => {
-					const rows = new Map((await options.db.items.toArray()).map((item) => [item.id, item]));
+					const rows = new Map(
+						(
+							await options.db.workspaceItems
+								.where('workspaceId')
+								.equals(options.workspaceId)
+								.toArray()
+						).map((item) => [item.id, item])
+					);
 					for (const change of staged.values()) rows.set(change.item.id, change.item);
 
 					return [...rows.values()]
@@ -152,6 +171,7 @@ export async function runLocalTransaction<T>(
 
 					const item: LocalItem = {
 						id,
+						workspaceId: options.workspaceId,
 						name,
 						note: input.note.trim(),
 						stage: input.stage ?? 'todo',
@@ -213,12 +233,16 @@ export async function runLocalTransaction<T>(
 			const changes = [...staged.values()].sort((a, b) => a.sequence - b.sequence);
 
 			if (changes.length === 1) {
-				await compactSingleItemTransactions(options.db, changes[0].item.id);
+				await compactSingleItemTransactions(
+					options.db,
+					options.workspaceId,
+					changes[0].item.id
+				);
 			}
 
 			if (changes.length > 0) {
-				await options.db.items.bulkPut(changes.map((change) => change.item));
-				await options.db.outbox.bulkAdd(
+				await options.db.workspaceItems.bulkPut(changes.map((change) => change.item));
+				await options.db.workspaceOutbox.bulkAdd(
 					changes.map((change) =>
 						createMutation({
 							createId,

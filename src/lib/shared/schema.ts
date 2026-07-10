@@ -28,11 +28,31 @@ export const TransactionSyncRequestSchema = Schema.Struct({
 	transactions: Schema.Array(SyncTransactionSchema)
 });
 
+export const CursorSyncRequestSchema = Schema.Struct({
+	protocolVersion: Schema.Literal(2),
+	clientId: Schema.String,
+	workspaceId: Schema.String,
+	cursor: Schema.NullOr(Schema.String),
+	snapshot: Schema.NullOr(
+		Schema.Struct({
+			id: Schema.String,
+			cursor: Schema.NullOr(Schema.String),
+			after: Schema.NullOr(Schema.String)
+		})
+	),
+	limit: Schema.Number,
+	transactions: Schema.Array(SyncTransactionSchema)
+});
+
 export const LegacySyncRequestSchema = Schema.Struct({
 	clientId: Schema.String,
 	changes: Schema.Array(SyncChangeSchema)
 });
 
-export const SyncRequestSchema = Schema.Union(TransactionSyncRequestSchema, LegacySyncRequestSchema);
+export const SyncRequestSchema = Schema.Union(
+	CursorSyncRequestSchema,
+	TransactionSyncRequestSchema,
+	LegacySyncRequestSchema
+);
 
 export type SyncRequestInput = Schema.Schema.Type<typeof SyncRequestSchema>;

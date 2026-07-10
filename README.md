@@ -25,6 +25,8 @@ That means the app stays useful offline, feels instant while online, and still c
 - **Transactions as a primitive:** related reads, writes, and outbox entries commit together locally and remain one atomic unit on the server.
 - **Durable sync:** the server persists records in Postgres or MySQL through a shared sync contract.
 - **Realtime convergence:** WebSockets send invalidations so other clients pull fresh state immediately.
+- **Bounded replication:** new clients bootstrap through paginated snapshots; existing clients pull only whole transactions after their durable cursor.
+- **Workspace isolation:** rows, commits, cursors, watermarks, snapshots, and realtime signals are partitioned by workspace.
 - **Deterministic conflict handling:** Effect validates requests, a transaction ledger makes retries idempotent, revisions and timestamps resolve stale writes, and tombstones make deletes sync correctly.
 - **Zero-config development:** memory storage works locally without a database.
 
@@ -37,8 +39,9 @@ User action
   -> reactive Svelte UI update
   -> POST /api/sync
   -> serializable Postgres/MySQL transaction
-  -> WebSocket invalidation
-  -> other clients pull and merge
+  -> append immutable transaction commit + advance cursor
+  -> workspace-scoped WebSocket invalidation
+  -> other clients pull commits after their cursor
 ```
 
 The local database is the render source. SQL is the durable shared source. WebSockets are only the notification path.
@@ -116,14 +119,14 @@ DATABASE_DRIVER=mysql
 DATABASE_URL=mysql://user:password@localhost:3306/self_sync
 ```
 
-The server creates the `sync_items` and `sync_transactions` tables automatically on first use. The raw schema files are also available in:
+The server can migrate the replication schema automatically on first use. For production, apply the checked-in schema during deployment so DDL is not part of request latency:
 
 - `src/lib/server/sql/schema.postgres.sql`
 - `src/lib/server/sql/schema.mysql.sql`
 
 ## Realtime
 
-The app keeps IndexedDB as the render source and uses WebSockets as an invalidation channel. When `POST /api/sync` applies a create, update, or delete, the server publishes `sync_changed`. Connected clients that did not originate the change immediately run `syncNow('realtime')` and merge the authoritative server state into Dexie.
+The app keeps IndexedDB as the render source and uses WebSockets as an invalidation channel. When `POST /api/sync` commits a transaction, the server publishes a workspace ID and latest cursor. Connected clients immediately request only commits after their local cursor. If a message is missed, reconnect, visibility, online, and periodic catch-up paths use the same cursor, so correctness never depends on a live socket.
 
 Local development uses the Vite WebSocket plugin:
 
@@ -149,7 +152,7 @@ MySQL sync still works through the outbox and background pull loop. Cross-instan
 
 ## API
 
-- `POST /api/sync` atomically applies queued transaction envelopes and returns authoritative server state.
+- `POST /api/sync` atomically applies queued transaction envelopes and returns a bounded snapshot page or whole commits after a cursor.
 - `GET /api/items` returns non-deleted server items.
 - `GET /api/health` reports the active storage mode.
 - `GET /api/realtime` upgrades to a WebSocket connection for realtime sync invalidations.
@@ -158,9 +161,27 @@ MySQL sync still works through the outbox and background pull loop. Cross-instan
 
 Local writes update IndexedDB first and enqueue a transaction envelope in the outbox. Repeated unsynced single-item edits are compacted, while multi-item transaction boundaries are preserved. The UI renders from Dexie `liveQuery`, so creates, edits, and deletes appear immediately without waiting for the network.
 
-`POST /api/sync` runs an Effect program that validates the request, applies each queued transaction through the selected storage adapter, and returns the authoritative server state. The client merges that response back into IndexedDB and atomically clears completed outbox transactions.
+`POST /api/sync` runs an Effect program that validates versioned requests, applies each queued transaction through the selected storage adapter, and returns a bounded replication page. Protocol v2 uses opaque decimal-string cursors so JavaScript never loses `BIGINT` precision. Protocol v1 remains available for rolling deployments and is the only path that returns a full-table response.
+
+A client without a cursor reads a stable, paginated bootstrap snapshot. Once initialized, it receives only immutable commit records after its cursor. Pages target a bounded record count and never split a multi-item transaction; one capped transaction may exceed that target. Applying rows, clearing completed outbox envelopes, and advancing the cursor happen in one Dexie transaction.
 
 Conflict handling is deterministic: newer `updatedAt` wins, equal timestamps use client and mutation IDs as a stable tie-breaker, and the transaction ledger makes retries idempotent. Deletes are tombstones, not hard local removals, so offline deletes sync correctly and other clients converge through the same merge path.
+
+## Scaling Model
+
+Normal sync work is proportional to new transactions, not the total number of workspace rows. The server keeps:
+
+- `sync_items` for current materialized state and tombstones
+- `sync_transactions` for idempotency and terminal outcomes
+- `sync_commits` and `sync_changes` for transaction-aligned cursor catch-up
+- `sync_clients` for active replica watermarks
+- `sync_workspace_state` for latest and compacted cursor boundaries
+
+Commit history, transaction ledgers, and tombstones are compacted behind the minimum active client watermark after the retention window. A client older than the compaction floor is reset before its queued writes are accepted, bootstraps a new snapshot, then resumes normal push/pull sync. Request size, transaction count, changes per transaction, field size, and page size are bounded server-side.
+
+Workspaces are replication partitions, not an authorization system. In a multi-tenant app, resolve the workspace from the authenticated session and verify membership on the server instead of trusting the request body. Postgres `LISTEN/NOTIFY` is a wake-up adapter rather than the durable log; higher-volume deployments can replace it with Redis, NATS, Kafka, Ably, or another broker without changing replication correctness.
+
+The domain terms and invariants live in [`CONTEXT.md`](./CONTEXT.md). The protocol decision is documented in [`docs/adr/0001-cursor-replication.md`](./docs/adr/0001-cursor-replication.md).
 
 ## Vercel Notes
 

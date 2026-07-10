@@ -37,6 +37,7 @@ function transaction(
 function stored(input: Partial<StoredSyncItem> & Pick<StoredSyncItem, 'id'>): StoredSyncItem {
 	return {
 		id: input.id,
+		workspaceId: input.workspaceId ?? 'default',
 		name: input.name ?? input.id,
 		note: input.note ?? '',
 		stage: input.stage ?? 'todo',

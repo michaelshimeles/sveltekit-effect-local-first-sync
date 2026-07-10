@@ -11,6 +11,8 @@ interface RealtimeSyncMessage {
 	type: 'sync_changed';
 	id: string;
 	sourceClientId: string;
+	workspaceId: string;
+	cursor: string;
 	itemIds: string[];
 	databaseMode: DatabaseMode;
 	serverTime: number;
@@ -23,6 +25,7 @@ const server = http.createServer((_request, response) => {
 	response.end('Expected WebSocket upgrade');
 });
 const wss = new WebSocketServer({ server });
+const socketWorkspaces = new WeakMap<WebSocket, string>();
 
 let unsubscribePromise: Promise<(() => void | Promise<void>) | null> | null = null;
 
@@ -97,7 +100,10 @@ function broadcast(message: RealtimeSyncMessage) {
 	const payload = JSON.stringify(message);
 
 	for (const client of wss.clients) {
-		if (client.readyState === WebSocket.OPEN) {
+		if (
+			client.readyState === WebSocket.OPEN &&
+			socketWorkspaces.get(client) === message.workspaceId
+		) {
 			client.send(payload);
 		}
 	}
@@ -113,10 +119,13 @@ function ensureSubscribed() {
 	return unsubscribePromise;
 }
 
-wss.on('connection', (socket) => {
+wss.on('connection', (socket, request) => {
+	const url = new URL(request.url ?? '/api/realtime', 'http://localhost');
+	const workspaceId = url.searchParams.get('workspaceId') || 'default';
+	socketWorkspaces.set(socket, workspaceId);
 	void ensureSubscribed().then(() => {
 		if (socket.readyState === WebSocket.OPEN) {
-			socket.send(JSON.stringify({ type: 'connected', serverTime: Date.now() }));
+			socket.send(JSON.stringify({ type: 'connected', workspaceId, serverTime: Date.now() }));
 		}
 	});
 });
